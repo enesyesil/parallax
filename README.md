@@ -4,7 +4,7 @@ Lightweight LLM Inference Load Balancer
 
 ## Motivation
 
-I am a final-year Computer Science student interested in infrastructure systems and LLM infrastructure. As part of my course **EECS 4171 (Parallel, Concurrent, and Distributed Algorithms)**, I wanted to connect the algorithms we are learning with how real companies (like OpenAI or Anthropic) run their inference systems.
+As a final-year Computer Science student interested in infrastructure systems and LLM infrastructure. As part of my course **EECS 4171 (Parallel, Concurrent, and Distributed Algorithms)**, I wanted to connect the algorithms we are learning with how real companies (like OpenAI or Anthropic) run their inference systems.
 
 In production, a big challenge is sending thousands of requests to multiple GPUs or servers, keeping latency low, and making sure resources are used efficiently. At its core, that is a **scheduling and load balancing problem**.
 
