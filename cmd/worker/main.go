@@ -71,7 +71,39 @@ func main() {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 { slowExtra = n }
 	}
 
+	type batchIn struct {
+		Items []workIn `json:"items"`
+	}
 
+	http.HandleFunc("/work_batch", func(w http.ResponseWriter, r *http.Request) {
+		var in batchIn
+		if err := json.NewDecoder(r.Body).Decode(&in); err != nil || len(in.Items) == 0 {
+			w.WriteHeader(400)
+			io.WriteString(w, `{"error":"bad json or empty batch"}`)
+			return
+		}
+	
+		// Optional slow knob (env): SLOW_MS adds extra latency per request
+		slowExtra := 0
+		if v := os.Getenv("SLOW_MS"); v != "" {
+			if n, err := strconv.Atoi(v); err == nil && n > 0 {
+				slowExtra = n
+			}
+		}
+	
+		total := 0
+		for _, it := range in.Items {
+			c := it.CostMS
+			if c <= 0 {
+				c = 50
+			}
+			total += c + slowExtra
+		}
+	
+		start := time.Now()
+		burn(total)
+		io.WriteString(w, fmt.Sprintf(`{"ok":true,"count":%d,"took_ms":%d}`, len(in.Items), time.Since(start).Milliseconds()))
+	})
 
 
 	http.HandleFunc("/work", func(w http.ResponseWriter, r *http.Request) {

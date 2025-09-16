@@ -3,10 +3,12 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"os"
+	"strconv"
 	"sync/atomic"
 	"time"
 
@@ -24,8 +26,11 @@ type LB struct {
 	ll     *scheduler.LeastLoad
 	p2c    *scheduler.P2C
 	policy atomic.Value // one of them "rr" | "ll" | "p2c"
+	statsByPolicy map[string]*core.Stats
 
 	stats *core.Stats
+
+	batcher *core.Batcher
 }
 
 func (lb *LB) currentPolicy() string {
@@ -69,6 +74,100 @@ func main() {
 	lb.policy.Store(string(core.PolicyRR))
 
 	lb.stats = core.NewStats(10 * time.Second)
+
+	enableBatch := os.Getenv("ENABLE_BATCH") == "1"
+
+
+	win := 20 * time.Millisecond
+
+	if v := os.Getenv("BATCH_WINDOW_MS"); v != "" {
+		if d, err := time.ParseDuration(v + "ms"); err == nil {
+			win = d
+		}
+	}
+
+	maxBatch := 8
+	if v := os.Getenv("MAX_BATCH_SIZE"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			maxBatch = n
+		}
+	}
+
+	
+	maxCost := 480
+	if v := os.Getenv("MAX_BATCH_COST"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			maxCost = n
+		}
+	}
+
+
+	if enableBatch {
+		
+		lb.batcher = core.NewBatcher(win, maxBatch, maxCost, func(batch []core.MicroReq) (int, error) {
+			
+			dst := lb.choose()
+			if dst == nil {
+				return 0, fmt.Errorf("no workers")
+			}
+			
+
+			lb.reg.MarkStart(dst.ID)
+	
+
+
+			items := make([]map[string]any, 0, len(batch))
+
+
+			sumCost := 0
+			for _, br := range batch {
+				items = append(items, map[string]any{
+					"cost":    br.Cost,
+					"payload": br.Payload,
+				})
+				sumCost += br.Cost
+			}
+	
+			body, _ := json.Marshal(map[string]any{"items": items})
+			start := time.Now()
+			resp, err := http.Post(dst.Addr+"/work_batch", "application/json", bytes.NewReader(body))
+			elapsed := time.Since(start)
+	
+			
+			lb.reg.MarkFinish(dst.ID, int(elapsed.Milliseconds()))
+	
+			if err != nil {
+				return 0, err
+			}
+			defer resp.Body.Close()
+	
+			
+			var out struct {
+				OK     bool `json:"ok"`
+				Count  int  `json:"count"`
+				TookMS int  `json:"took_ms"`
+			}
+			_ = json.NewDecoder(resp.Body).Decode(&out)
+	
+			
+			metrics.ReqTotal.WithLabelValues("ok").Add(float64(len(batch)))
+			metrics.Latency.Observe(elapsed.Seconds())
+	
+			
+			pol := lb.currentPolicy()
+			if s := lb.statsByPolicy[pol]; s != nil {
+				now := time.Now()
+				ls := elapsed.Seconds()
+				for range batch {
+					s.Add(now, ls)
+				}
+			}
+			// reply took_ms to each item’s waiter
+			return int(elapsed.Milliseconds()), nil
+		})
+		go lb.batcher.Run()
+	}
+
 
 	
 	http.HandleFunc("/register", func(w http.ResponseWriter, r *http.Request) {
@@ -120,6 +219,26 @@ func main() {
 			return
 		}
 
+		if lb.batcher != nil {
+			
+			respCh := make(chan core.MicroResp, 1)
+			lb.batcher.Enqueue(core.MicroReq{
+				Cost:    in.Cost,
+				Payload: in.Payload,
+				RespCh:  respCh,
+			})
+			resp := <-respCh
+			if !resp.OK {
+				metrics.ReqTotal.WithLabelValues("err").Inc()
+				w.WriteHeader(503)
+				io.WriteString(w, `{"error":"batch dispatch failed"}`)
+				return
+			}
+			
+			io.WriteString(w, fmt.Sprintf(`{"ok":true,"took_ms":%d}`, resp.TookMS))
+			return
+		}
+
 		dst := lb.choose()
 		if dst == nil {
 			metrics.ReqTotal.WithLabelValues("drop").Inc()
@@ -148,6 +267,8 @@ func main() {
 			io.WriteString(w, `{"error":"worker unreachable"}`)
 			return
 		}
+
+
 		defer resp.Body.Close()
 		io.Copy(w, resp.Body)
 
@@ -156,6 +277,8 @@ func main() {
 		metrics.ReqTotal.WithLabelValues("ok").Inc()
 		metrics.Latency.Observe(elapsed.Seconds())
 	})
+
+	
 
 	http.HandleFunc("/stats", func(w http.ResponseWriter, r *http.Request) {
         now := time.Now()
